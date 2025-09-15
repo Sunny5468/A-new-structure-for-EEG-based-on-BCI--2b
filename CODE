@@ -10,25 +10,23 @@ from sklearn.model_selection import train_test_split
 import pandas as pd
 
 
+
 # -------------------------------
-# 基本设置
-# -------------------------------
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # 避免库冲突
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE' 
 seed = 42
 np.random.seed(seed)
 torch.manual_seed(seed)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", device)
 
-# -------------------------------
-# 检查单个GDF文件信息
+
 # -------------------------------
 def check_data_info(file_path, img_save=False, img_dir='./img'):
     raw_gdf = mne.io.read_raw_gdf(file_path, stim_channel="auto", verbose='ERROR')
     raw_gdf.load_data()
     data = raw_gdf.get_data()
 
-    # 修复nan
+
     for i_chan in range(data.shape[0]):
         this_chan = data[i_chan]
         data[i_chan] = np.where(this_chan == np.min(this_chan), np.nan, this_chan)
@@ -49,8 +47,7 @@ def check_data_info(file_path, img_save=False, img_dir='./img'):
         plt.savefig(os.path.join(img_dir, 'EEG_channel.png'))
     plt.show()
 
-# -------------------------------
-# 加载数据，滑动窗口切片
+
 # -------------------------------
 def load_data_BCICIV_2b_gdf(root_dir="./BCICIV_2b_gdf"):
     expend_data = []
@@ -122,8 +119,7 @@ def load_preprocessed_data(npz_path):
     print("Label shape:", label.shape)
     return data, label
 
-# -------------------------------
-# PyTorch Dataset
+
 # -------------------------------
 class EEGDataset(Dataset):
     def __init__(self, Data, Label):
@@ -140,14 +136,13 @@ class EEGDataset(Dataset):
         label = self.Label[index].squeeze()
         return data, label
     
-# -------------------------------
-# CNN + LSTM 模型
+
 # -------------------------------
 class EEG_CNN_LSTM(nn.Module):
     def __init__(self, n_channels=3, n_classes=2, hidden_size=128, num_layers=1):
         super(EEG_CNN_LSTM, self).__init__()
         
-        # CNN 提取空间特征
+    
         self.conv1 = nn.Conv1d(n_channels, 16, kernel_size=7, padding=3)  # 跨通道卷积
         self.bn1 = nn.BatchNorm1d(16)
         self.pool1=nn.MaxPool1d(2)
@@ -157,49 +152,48 @@ class EEG_CNN_LSTM(nn.Module):
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.3)
 
-        # LSTM 输入：CNN 输出的特征序列
+    
         self.lstm = nn.LSTM(
-            input_size=32,      # CNN 输出的通道数
+            input_size=32,     
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             bidirectional=True
         )
 
-        # 分类层
+
         self.fc = nn.Linear(hidden_size*2, n_classes)
 
     def forward(self, x):
-        # x: [batch, channels, time]
     
 
-        # CNN 提取特征
-        x = self.conv1(x)    # [batch, 16, 1, time]
+  
+        x = self.conv1(x)  
         x = self.bn1(x)
         x = self.relu(x)
         x = self.pool1(x)
         x = self.conv2(x)
         x = self.bn2(x)
         x = self.relu(x)
-        x = self.pool2(x)    # [batch, 32, 1,
+        x = self.pool2(x)    
         x = self.dropout(x)
 
 
-        # 调整维度给 LSTM
-        x = x.permute(0, 2, 1)  # [batch, time, features]
+  
+        x = x.permute(0, 2, 1) 
 
-        # LSTM 学习时序特征
-        out, _ = self.lstm(x)   # [batch, time, hidden*2]
+   
+        out, _ = self.lstm(x)   
 
-        # 取最后一个时间步
-        out = out[:, -1, :]     # [batch, hidden*2]
+   
+        out = out[:, -1, :]     
 
-        # 分类
-        out = self.fc(out)      # [batch, n_classes]
+   
+        out = self.fc(out)   
         return out
 
 # -------------------------------
-# 训练与验证函数
+
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, n_epochs=100, patience=10):
     train_losses, train_accs = [], []
@@ -210,7 +204,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, n_epochs=
     patience_counter = 0
 
     for epoch in range(n_epochs):
-        # ---------- 训练 ----------
+ 
         model.train()
         epoch_loss, correct, total = 0, 0, 0
         for batch_data, batch_label in train_loader:
@@ -231,7 +225,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, n_epochs=
         train_losses.append(epoch_loss/total)
         train_accs.append(correct/total)
 
-        # ---------- 验证 ----------
+ 
         model.eval()
         val_loss, val_correct, val_total = 0, 0, 0
         with torch.no_grad():
@@ -253,7 +247,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, n_epochs=
               f"Train Loss: {train_losses[-1]:.4f} Acc: {train_accs[-1]:.4f} | "
               f"Val Loss: {val_losses[-1]:.4f} Acc: {val_accs[-1]:.4f}")
 
-        # ---------- 早停 ----------
+      
         if val_losses[-1] < best_val_loss:
             best_val_loss = val_losses[-1]
             best_epoch = epoch
@@ -270,7 +264,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, n_epochs=
 
 
 def save_predictions(model, loader, file_name="train_predictions.csv"):
-    """保存预测 vs 真实值到文件"""
+
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -307,19 +301,18 @@ def plot_metrics(train_losses, train_accs, val_losses, val_accs):
     plt.title('Accuracy Curve')
 
     plt.show()
-# -------------------------------
-# 主流程
+
 # -------------------------------
 if __name__ == "__main__":
-    # 检查单文件信息
+
     file_path = "Desktop/科研/BCICIV_2b_gdf/B0101T.gdf"
     check_data_info(file_path, img_save=False)
 
-    # 加载所有数据
+
    # data, label = load_data_BCICIV_2b_gdf(root_dir="Desktop/科研/BCICIV_2b_gdf/")
     data, label = load_preprocessed_data("Desktop/科研/preprocessed_eeg.npz")
 
-   # 划分训练集和验证集
+
     X_train, X_val, y_train, y_val = train_test_split(data, label, test_size=0.2, random_state=seed)
     train_dataset = EEGDataset(X_train, y_train)
     val_dataset = EEGDataset(X_val, y_val)
@@ -327,22 +320,22 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
-    # 模型、损失和优化器
+
     n_channels = data.shape[1]
     model = EEG_CNN_LSTM(n_channels=n_channels, n_classes=2).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    # 训练
+
     train_losses, train_accs, val_losses, val_accs = train_model(
         model, train_loader, val_loader, criterion, optimizer, n_epochs=1000, patience=10)
 
-    # 加载最佳模型
+
     best_model = EEG_CNN_LSTM(n_channels=n_channels, n_classes=2).to(device)
     best_model.load_state_dict(torch.load("best_model.pth"))
 
-    # 保存训练集预测结果
+
     save_predictions(best_model, train_loader, file_name="train_predictions.csv")
 
-    # 画图
+
     plot_metrics(train_losses, train_accs, val_losses, val_accs)
