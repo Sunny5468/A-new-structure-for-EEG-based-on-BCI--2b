@@ -1,0 +1,348 @@
+import os
+import mne
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+import pandas as pd
+
+
+# -------------------------------
+# 基本设置
+# -------------------------------
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # 避免库冲突
+seed = 42
+np.random.seed(seed)
+torch.manual_seed(seed)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("Using device:", device)
+
+# -------------------------------
+# 检查单个GDF文件信息
+# -------------------------------
+def check_data_info(file_path, img_save=False, img_dir='./img'):
+    raw_gdf = mne.io.read_raw_gdf(file_path, stim_channel="auto", verbose='ERROR')
+    raw_gdf.load_data()
+    data = raw_gdf.get_data()
+
+    # 修复nan
+    for i_chan in range(data.shape[0]):
+        this_chan = data[i_chan]
+        data[i_chan] = np.where(this_chan == np.min(this_chan), np.nan, this_chan)
+        mask = np.isnan(data[i_chan])
+        chan_mean = np.nanmean(data[i_chan])
+        data[i_chan, mask] = chan_mean
+
+    events, events_id = mne.events_from_annotations(raw_gdf)
+    print("Number of events:", len(events))
+    print(events_id)
+    print("Raw info:", raw_gdf.info)
+
+    raw_gdf = mne.io.RawArray(data, raw_gdf.info, verbose='ERROR')
+    raw_gdf.plot()
+    if img_save:
+        if not os.path.exists(img_dir):
+            os.makedirs(img_dir)
+        plt.savefig(os.path.join(img_dir, 'EEG_channel.png'))
+    plt.show()
+
+# -------------------------------
+# 加载数据，滑动窗口切片
+# -------------------------------
+def load_data_BCICIV_2b_gdf(root_dir="./BCICIV_2b_gdf"):
+    expend_data = []
+    expend_label = []
+    files = os.listdir(root_dir)
+    for file in files:
+        file_path = os.path.join(root_dir, file)
+        print("Loading file:", file)
+        raw_gdf = mne.io.read_raw_gdf(file_path, stim_channel='auto', verbose='ERROR')
+        raw_gdf.load_data()
+        raw_gdf.filter(0.5, 40., fir_design='firwin', verbose='ERROR')
+        raw_gdf.notch_filter(50)
+
+        ica = mne.preprocessing.ICA(n_components=6, random_state=97, max_iter='auto', verbose='ERROR')
+        ica.fit(raw_gdf)
+        
+        eog_indices,eog_scores = ica.find_bads_eog(raw_gdf, ch_name = ["EOG:ch01", "EOG:ch02", "EOG:ch03"])
+        ica.exclude = eog_indices
+
+        raw_clean = ica.apply(raw_gdf.copy())
+        raw_gdf = raw_clean.copy().pick_types(eeg=True, exclude=[])
+
+        raw_gdf.load_data()
+        data = raw_gdf.get_data()
+        for i_chan in range(data.shape[0]):
+            this_chan = data[i_chan]
+            data[i_chan] = np.where(this_chan == np.min(this_chan), np.nan, this_chan)
+            mask = np.isnan(data[i_chan])
+            chan_mean = np.nanmean(data[i_chan])
+            data[i_chan, mask] = chan_mean
+
+        events, events_id = mne.events_from_annotations(raw_gdf, verbose='ERROR')
+        if '769' not in events_id or '770' not in events_id:
+            print('WARNING: No 769 or 770 event in file:', file)
+            continue
+
+        raw_gdf = mne.io.RawArray(data, raw_gdf.info, verbose='ERROR')
+        tmin, tmax = 1., 5.
+        MI_event_id = dict({'769': events_id['769'], '770': events_id['770']})
+        epochs = mne.Epochs(raw_gdf, events, MI_event_id, tmin, tmax,
+                            proj=True, baseline=None, preload=True, verbose='ERROR')
+
+        label_transfer = {events_id['769']: 0, events_id['770']: 1}
+        labels = epochs.events[:, -1]
+        labels = np.array([label_transfer[label] for label in labels])
+
+        data = epochs.get_data()
+
+        for i in range(11):
+            expend_data.append(data[:, :, i*50:i*50+500])
+            expend_label.append(labels)
+
+    expend_data = np.concatenate(expend_data, axis=0)
+    expend_label = np.concatenate(expend_label, axis=0).reshape(-1,1)
+    expend_data = (expend_data - expend_data.mean(axis=2, keepdims=True)) / (expend_data.std(axis=2, keepdims=True) + 1e-6)
+
+    print("Samples obtained:", expend_data.shape[0])
+    print("Data shape:", expend_data.shape)
+    np.savez("Desktop/科研/preprocessed_eeg.npz", data=expend_data, label=expend_label)
+    print(f"Saved preprocessed data to 'Desktop/科研/preprocessed_eeg.npz'")
+    return expend_data, expend_label
+
+def load_preprocessed_data(npz_path):
+    loaded = np.load(npz_path)
+    data = loaded['data']
+    label = loaded['label']
+    print("Loaded preprocessed data from:", npz_path)
+    print("Data shape:", data.shape)
+    print("Label shape:", label.shape)
+    return data, label
+
+# -------------------------------
+# PyTorch Dataset
+# -------------------------------
+class EEGDataset(Dataset):
+    def __init__(self, Data, Label):
+        self.Data = torch.Tensor(Data).float()
+        self.Label = torch.Tensor(Label).long()
+
+    def __len__(self):
+        return len(self.Data)
+
+    def __getitem__(self, index):
+        data = self.Data[index]
+        if data.ndim == 1:
+            data = data.unsqueeze(0)  # 单通道处理
+        label = self.Label[index].squeeze()
+        return data, label
+    
+# -------------------------------
+# CNN + LSTM 模型
+# -------------------------------
+class EEG_CNN_LSTM(nn.Module):
+    def __init__(self, n_channels=3, n_classes=2, hidden_size=128, num_layers=1):
+        super(EEG_CNN_LSTM, self).__init__()
+        
+        # CNN 提取空间特征
+        self.conv1 = nn.Conv1d(n_channels, 16, kernel_size=7, padding=3)  # 跨通道卷积
+        self.bn1 = nn.BatchNorm1d(16)
+        self.pool1=nn.MaxPool1d(2)
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.pool2 = nn.MaxPool1d(2)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
+
+        # LSTM 输入：CNN 输出的特征序列
+        self.lstm = nn.LSTM(
+            input_size=32,      # CNN 输出的通道数
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        # 分类层
+        self.fc = nn.Linear(hidden_size*2, n_classes)
+
+    def forward(self, x):
+        # x: [batch, channels, time]
+    
+
+        # CNN 提取特征
+        x = self.conv1(x)    # [batch, 16, 1, time]
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.pool1(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.pool2(x)    # [batch, 32, 1,
+        x = self.dropout(x)
+
+
+        # 调整维度给 LSTM
+        x = x.permute(0, 2, 1)  # [batch, time, features]
+
+        # LSTM 学习时序特征
+        out, _ = self.lstm(x)   # [batch, time, hidden*2]
+
+        # 取最后一个时间步
+        out = out[:, -1, :]     # [batch, hidden*2]
+
+        # 分类
+        out = self.fc(out)      # [batch, n_classes]
+        return out
+
+# -------------------------------
+# 训练与验证函数
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, n_epochs=100, patience=10):
+    train_losses, train_accs = [], []
+    val_losses, val_accs = [], []
+
+    best_val_loss = float('inf')
+    best_epoch = -1
+    patience_counter = 0
+
+    for epoch in range(n_epochs):
+        # ---------- 训练 ----------
+        model.train()
+        epoch_loss, correct, total = 0, 0, 0
+        for batch_data, batch_label in train_loader:
+            batch_data = batch_data.to(device)
+            batch_label = batch_label.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(batch_data)
+            loss = criterion(outputs, batch_label)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item() * batch_data.size(0)
+            _, predicted = outputs.max(1)
+            correct += (predicted == batch_label).sum().item()
+            total += batch_label.size(0)
+
+        train_losses.append(epoch_loss/total)
+        train_accs.append(correct/total)
+
+        # ---------- 验证 ----------
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        with torch.no_grad():
+            for batch_data, batch_label in val_loader:
+                batch_data = batch_data.to(device)
+                batch_label = batch_label.to(device)
+                outputs = model(batch_data)
+                loss = criterion(outputs, batch_label)
+
+                val_loss += loss.item() * batch_data.size(0)
+                _, predicted = outputs.max(1)
+                val_correct += (predicted == batch_label).sum().item()
+                val_total += batch_label.size(0)
+
+        val_losses.append(val_loss/val_total)
+        val_accs.append(val_correct/val_total)
+
+        print(f"Epoch [{epoch+1}/{n_epochs}] "
+              f"Train Loss: {train_losses[-1]:.4f} Acc: {train_accs[-1]:.4f} | "
+              f"Val Loss: {val_losses[-1]:.4f} Acc: {val_accs[-1]:.4f}")
+
+        # ---------- 早停 ----------
+        if val_losses[-1] < best_val_loss:
+            best_val_loss = val_losses[-1]
+            best_epoch = epoch
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_model.pth")
+            print("  --> Best model saved at epoch", epoch+1)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}, best epoch was {best_epoch+1}")
+                break
+
+    return train_losses, train_accs, val_losses, val_accs
+
+
+def save_predictions(model, loader, file_name="train_predictions.csv"):
+    """保存预测 vs 真实值到文件"""
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch_data, batch_label in loader:
+            batch_data = batch_data.to(device)
+            outputs = model(batch_data)
+            _, predicted = outputs.max(1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(batch_label.numpy())
+
+    df = pd.DataFrame({"True_Label": all_labels, "Predicted": all_preds})
+    df.to_csv(file_name, index=False, encoding="utf-8-sig")
+    print(f"Predictions saved to {file_name}")
+
+
+def plot_metrics(train_losses, train_accs, val_losses, val_accs):
+    epochs = np.arange(1, len(train_losses)+1)
+    plt.figure(figsize=(12,5))
+
+    plt.subplot(1,2,1)
+    plt.plot(epochs, train_losses, 'r-', label='Train Loss')
+    plt.plot(epochs, val_losses, 'g--', label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss Curve')
+
+    plt.subplot(1,2,2)
+    plt.plot(epochs, train_accs, 'b-', label='Train Acc')
+    plt.plot(epochs, val_accs, 'm--', label='Val Acc')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Accuracy Curve')
+
+    plt.show()
+# -------------------------------
+# 主流程
+# -------------------------------
+if __name__ == "__main__":
+    # 检查单文件信息
+    file_path = "Desktop/科研/BCICIV_2b_gdf/B0101T.gdf"
+    check_data_info(file_path, img_save=False)
+
+    # 加载所有数据
+   # data, label = load_data_BCICIV_2b_gdf(root_dir="Desktop/科研/BCICIV_2b_gdf/")
+    data, label = load_preprocessed_data("Desktop/科研/preprocessed_eeg.npz")
+
+   # 划分训练集和验证集
+    X_train, X_val, y_train, y_val = train_test_split(data, label, test_size=0.2, random_state=seed)
+    train_dataset = EEGDataset(X_train, y_train)
+    val_dataset = EEGDataset(X_val, y_val)
+
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+
+    # 模型、损失和优化器
+    n_channels = data.shape[1]
+    model = EEG_CNN_LSTM(n_channels=n_channels, n_classes=2).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    # 训练
+    train_losses, train_accs, val_losses, val_accs = train_model(
+        model, train_loader, val_loader, criterion, optimizer, n_epochs=1000, patience=10)
+
+    # 加载最佳模型
+    best_model = EEG_CNN_LSTM(n_channels=n_channels, n_classes=2).to(device)
+    best_model.load_state_dict(torch.load("best_model.pth"))
+
+    # 保存训练集预测结果
+    save_predictions(best_model, train_loader, file_name="train_predictions.csv")
+
+    # 画图
+    plot_metrics(train_losses, train_accs, val_losses, val_accs)
